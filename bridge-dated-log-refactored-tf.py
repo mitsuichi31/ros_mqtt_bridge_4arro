@@ -71,6 +71,11 @@ MQTT_PASSWORD = "sI7G@DijuY"
 LOG_FILE_DIRECTORY = "." # Directory where logs will be stored. Can be changed.
 MAX_LOG_FILES = 5
 
+# --- ★★★ 追加: MQTT送信間隔（秒）★★★ ---
+MQTT_SEND_INTERVAL = 0.02  # 20ミリ秒
+# 
+FORCE_DISABLE_INTERVAL = 2.0 # 2 seconds
+
 class McuNavstackBridge(Node):
     """
     ROS2 node to bridge communication between an MCU and Navstack.
@@ -126,10 +131,11 @@ class McuNavstackBridge(Node):
         self.publish_static_transforms()
         # ----------------------------
 
-        # 外部制御モードが有効かどうかを追跡するフラグ
+        # --- ★★★ 修正: 状態変数とタイムアウト処理の変更 ★★★ ---
         self.external_control_enabled = False
-        # 2秒後に外部制御を無効にするためのタイマー
-        self.disable_timer = None
+        self.last_mqtt_send_time = 0.0
+        self.last_twist_time = 0.0  # 最後にTwistメッセージを受信した時刻
+        self.timeout_check_timer = self.create_timer(0.5, self.check_timeout_callback) # 0.5秒ごとにタイムアウトをチェック
 
         # # Log queue and thread setup
         # self.log_queue = queue.Queue()
@@ -391,38 +397,46 @@ class McuNavstackBridge(Node):
             self.get_logger().error(f"Failed to publish MQTT message to {mqtt_topic}: {e}")
             self.log_message("ERROR", mqtt_topic, f"MQTT publish error: {e}")
 
-    def disable_external_control_callback(self):
+    def check_timeout_callback(self):
         """
-        Timer callback to disable external control mode.
+        0.5秒ごとに呼び出され、Twistメッセージの受信が2秒以上途絶えたかを監視する。
         """
-        self.external_control(enable=False)
-        # タイマーをNoneにリセット
-        self.disable_timer = None
+        # 外部制御が有効な場合のみチェックを実行
+        if self.external_control_enabled:
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            # 最後にメッセージを受信してから2秒以上経過していたら無効化
+            if (current_time - self.last_twist_time) > FORCE_DISABLE_INTERVAL:
+                self.get_logger().info("Control timed out. Disabling external control.")
+                self.external_control(enable=False)
 
     def twist_callback(self, twist_msg):
         """
-        Callback for the ROS2 /robot/cmd_vel topic.
-        Publishes the received Twist message to the MCU via MQTT.
+        /robot/cmd_vel トピックのコールバック。
+        - 最終受信時刻を更新し、必要であれば外部制御を有効化する。
+        - 速度指令のMQTT送信は20ms間隔に間引く。
         """
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        self.last_twist_time = current_time  # 常に最終受信時刻を更新
 
-        # 既存のタイマーがあればキャンセル
-        if self.disable_timer is not None:
-            self.disable_timer.cancel()
-
-        # 新しい2秒タイマーを開始
-        self.disable_timer = self.create_timer(2.0, self.disable_external_control_callback)
-
-        # 外部制御が有効でなければ有効化する
+        # --- 外部制御の有効化 ---
         if not self.external_control_enabled:
+            self.get_logger().info("Control starting: Sending enable command.")
             self.external_control(enable=True)
 
-        self.get_logger().info("Received a Twist message from Navstack.")
+        # --- 速度指令の間引き処理 ---
+        if (current_time - self.last_mqtt_send_time) < MQTT_SEND_INTERVAL:
+            return
+
+        # --- 間引き後のMQTT送信処理 ---
+        self.last_mqtt_send_time = current_time
+
+        self.get_logger().info("Sending throttled Twist message to MQTT.")
         
         v_mps = twist_msg.linear.x
-        w_degps = twist_msg.angular.z * 180 / 3.14159  # rad/s to deg/s
+        w_degps = twist_msg.angular.z * 180 / 3.14159
 
         mqtt_payload = {
-            "v_mps": f"{v_mps}", 
+            "v_mps": f"{v_mps}",
             "w_degps": f"{w_degps}"
         }
         
@@ -431,20 +445,17 @@ class McuNavstackBridge(Node):
         try:
             self.mqtt_client.publish(mqtt_topic, json.dumps(mqtt_payload))
             self.log_message("SEND", mqtt_topic, mqtt_payload)
-            self.get_logger().info(f"Published speed command to MQTT topic: {mqtt_topic}")
         except Exception as e:
-            self.get_logger().error(f"Failed to publish MQTT message to {mqtt_topic}: {e}")
-            self.log_message("ERROR", mqtt_topic, f"MQTT publish error: {e}")
+            self.get_logger().error(f"Failed to publish MQTT message: {e}")
 
-
-    def on_shutdown(self):
-        """Stops the log worker thread cleanly."""
-        self.log_thread_stop_event.set()
-        self.log_thread.join()
-        self.get_logger().info("Log worker thread shut down.")
-        # Optionally, disconnect MQTT client cleanly on shutdown
-        self.mqtt_client.loop_stop()
-        self.mqtt_client.disconnect()
+        def on_shutdown(self):
+            """Stops the log worker thread cleanly."""
+            self.log_thread_stop_event.set()
+            self.log_thread.join()
+            self.get_logger().info("Log worker thread shut down.")
+            # Optionally, disconnect MQTT client cleanly on shutdown
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
 
 def main(args=None):
     rclpy.init(args=args)
