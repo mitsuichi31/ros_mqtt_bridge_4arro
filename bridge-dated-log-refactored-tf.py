@@ -84,6 +84,9 @@ class McuNavstackBridge(Node):
         super().__init__('mcu_navstack_bridge_node')
         self.get_logger().info("Starting MCU-Navstack Bridge Node")
 
+        # ★★★ 追加: ロギング制御フラグ ★★★
+        self.logging_enabled = False # True: ロギングを実行, False: ロギングをスキップ
+
         # Log queue and thread setup
         self.log_queue = queue.Queue()
         self.log_thread_stop_event = threading.Event()
@@ -137,20 +140,6 @@ class McuNavstackBridge(Node):
         self.last_twist_time = 0.0  # 最後にTwistメッセージを受信した時刻
         self.timeout_check_timer = self.create_timer(0.5, self.check_timeout_callback) # 0.5秒ごとにタイムアウトをチェック
 
-        # # Log queue and thread setup
-        # self.log_queue = queue.Queue()
-        # self.log_thread_stop_event = threading.Event()
-        
-        # # Ensure log directory exists
-        # try:
-        #     os.makedirs(LOG_FILE_DIRECTORY, exist_ok=True)
-        # except OSError as e:
-        #     self.get_logger().error(f"Failed to create log directory {LOG_FILE_DIRECTORY}: {e}")
-        #     raise # Critical error, cannot log
-
-        # self.log_thread = threading.Thread(target=self.log_worker)
-        # self.log_thread.start()
-        # self.get_logger().info("Log worker thread started.")
 
     # --------------------------------------------------------------------
     # 新規メソッド: 静的座標変換 (Static TF) の公開
@@ -240,8 +229,21 @@ class McuNavstackBridge(Node):
                 except OSError as e:
                     self.get_logger().error(f"Error deleting file {old_file}: {e}")
 
+    def enable_logging(self, enable: bool):
+        """
+        Dynamically enables or disables file logging.
+        """
+        self.logging_enabled = enable
+        state = "Enabled" if enable else "Disabled"
+        self.get_logger().info(f"File logging has been {state}.")
+
     def log_message(self, direction, topic, data):
         """Adds a log entry to the queue."""
+
+        # ★★★ 修正: ロギングが有効でない場合は処理をスキップ ★★★
+        if not self.logging_enabled:
+            return
+        
         timestamp = datetime.datetime.now().isoformat()
         # Ensure data is JSON serializable if it's an object/dict for consistent logging
         try:
